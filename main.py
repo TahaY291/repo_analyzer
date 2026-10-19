@@ -1,28 +1,45 @@
-from contextlib import asynccontextmanager
 import logging
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import update
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+from app.agent.github_client import github_client
+from app.auth.router import router as auth_router
 from app.core.config import settings
-from app.core.database import engine
+from app.core.database import SessionLocal, engine
 from app.core.exceptions import register_exception_handlers
 from app.core.redis import redis_client
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
-from app.core.config import settings
-from app.core.security_headers import SecurityHeadersMiddleware
-from app.auth.router import router as auth_router
 from app.core.request_context import RequestContextMiddleware
+from app.core.security_headers import SecurityHeadersMiddleware
+from app.investigations.models import Investigation
+from app.investigations.router import router as agent_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-
-# add this BEFORE the other middleware, so it ends up innermost
+log = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ---- startup ----
     await redis_client.ping()
-    print("Connected to Redis")
+    log.info("Connected to Redis")
+
+    # A restart kills background tasks, so anything still pending/running is dead.
+    async with SessionLocal() as db:
+        await db.execute(
+            update(Investigation)
+            .where(Investigation.status.in_(["pending", "running"]))
+            .values(status="interrupted", error="The server restarted while this investigation was running.")
+        )
+        await db.commit()
+
     yield
+
+    # ---- shutdown ----
+    await github_client.aclose()
     await redis_client.aclose()
     await engine.dispose()
 
@@ -34,7 +51,7 @@ app = FastAPI(
 )
 
 register_exception_handlers(app)
-app.add_middleware(RequestContextMiddleware)
+app.add_middleware(RequestContextMiddleware)   # added first, so it ends up innermost
 app.add_middleware(SecurityHeadersMiddleware, hsts=settings.environment == "production")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
 if settings.cors_origins:
@@ -46,6 +63,7 @@ if settings.cors_origins:
         allow_headers=["*"],
     )
 app.include_router(auth_router, prefix="/api/v1")
+app.include_router(agent_router, prefix="/api/v1")
 
 
 @app.get("/health")

@@ -1,6 +1,7 @@
 from app.core.config import settings
 from app.core.database import Base
 from app.auth import models as auth_models  # noqa: F401
+from app.investigations import models as investigation_models  # noqa: F401
 import asyncio
 from logging.config import fileConfig
 

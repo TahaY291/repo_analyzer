@@ -2,7 +2,7 @@ import operator
 from typing import Annotated , Literal , TypedDict
 
 from langchain_core.messages import AnyMessage
-from langchain_core.messages import add_messages
+from langgraph.graph.message import add_messages
 
 class Finding(TypedDict):
     file: str
@@ -26,9 +26,13 @@ class InvestigationState(TypedDict):
     files_read: Annotated[list[str], operator.add]
     findings: Annotated[list[Finding], operator.add]
 
-    # control
     step: int
-    stop_reason : str | None
+    tokens_in: int
+    tokens_out: int
+    stop_reason: str | None
+    next_hint: str | None
 
     # output
     report : dict | None
+
+    chunks_read: Annotated[list[str], operator.add]   # e.g. "src/click/core.py@0"
