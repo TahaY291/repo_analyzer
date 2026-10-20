@@ -31,6 +31,12 @@ target_metadata = Base.metadata
 # my_important_option = config.get_main_option("my_important_option")
 # ... etc.
 
+def include_object(obj, name, type_, reflected, compare_to):
+    # LangGraph creates and owns its checkpoint tables. Alembic must not touch them.
+    if type_ == "table" and name.startswith("checkpoint"):
+        return False
+    return True
+
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode.

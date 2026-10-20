@@ -10,7 +10,7 @@ from app.agent.tools import TOOLS
 from app.core.config import settings
 
 
-def build_graph():
+def build_graph(checkpointer=None):
     graph = StateGraph(InvestigationState)
 
     graph.add_node("fetch_tree", fetch_tree)
@@ -30,7 +30,7 @@ def build_graph():
     )
     graph.add_edge("write_report", END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 agent_graph = build_graph()

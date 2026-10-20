@@ -5,6 +5,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import update
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from app.agent.checkpoint import open_checkpointer
+from app.agent.graph import build_graph
 
 from app.agent.github_client import github_client
 from app.auth.router import router as auth_router
@@ -23,26 +25,29 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ---- startup ----
     await redis_client.ping()
     log.info("Connected to Redis")
 
-    # A restart kills background tasks, so anything still pending/running is dead.
-    async with SessionLocal() as db:
-        await db.execute(
-            update(Investigation)
-            .where(Investigation.status.in_(["pending", "running"]))
-            .values(status="interrupted", error="The server restarted while this investigation was running.")
-        )
-        await db.commit()
+    async with open_checkpointer() as saver:
+        app.state.agent_graph = build_graph(saver)
 
-    yield
+        # A restart kills background tasks. Mark them interrupted: they can now be resumed.
+        try:
+            async with SessionLocal() as db:
+                await db.execute(
+                    update(Investigation)
+                    .where(Investigation.status.in_(["pending", "running"]))
+                    .values(status="interrupted", error="The server stopped while this was running. You can resume it.")
+                )
+                await db.commit()
+        except Exception:
+            log.exception("Could not mark unfinished investigations")
 
-    # ---- shutdown ----
+        yield
+
     await github_client.aclose()
     await redis_client.aclose()
     await engine.dispose()
-
 
 app = FastAPI(
     title="GitHub Repository Intelligence Agent",

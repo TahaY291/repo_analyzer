@@ -3,16 +3,24 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from langchain_core.messages import AIMessage
+from sqlalchemy import func, select
+
 from app.agent.github_client import GitHubError, GitHubUnavailable, RateLimited, RepoNotFound
-from app.agent.graph import agent_graph, make_initial_state, merge_update, run_config
+from app.agent.graph import make_initial_state, merge_update, run_config
+from app.agent.llm import LLMBusy
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.investigations.models import Investigation, InvestigationStatus, TraceStep
 
 log = logging.getLogger(__name__)
+OUTPUT_PREVIEW_CHARS = 1500
 
-OUTPUT_PREVIEW_CHARS = 1500   # the trace keeps a preview, never whole files
-
+def _last_tool_call(messages) -> dict | None:
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            return msg.tool_calls[0]
+    return None
 
 def _describe(node: str, changes: dict, last_call: dict | None) -> dict:
     """Turn one node's update into the columns of a TraceStep row."""
@@ -51,30 +59,49 @@ def _describe(node: str, changes: dict, last_call: dict | None) -> dict:
     return {}
 
 
-async def run_investigation(investigation_id: uuid.UUID) -> None:
-    # A background task cannot reuse the request's session (it is closed by then), so it opens its own.
+    
+async def run_investigation(investigation_id: uuid.UUID, graph, resume: bool = False) -> None:
     async with SessionLocal() as db:
         inv = await db.get(Investigation, investigation_id)
         if inv is None:
             log.error("Investigation %s not found", investigation_id)
             return
 
-        # Copy plain values now: after a commit the ORM object's fields can be expired.
         repo_url, owner, repo, focus = inv.repo_url, inv.owner, inv.repo, inv.focus
-
         inv.status = InvestigationStatus.RUNNING.value
-        inv.started_at = datetime.now(timezone.utc)
+        inv.started_at = inv.started_at or datetime.now(timezone.utc)
+        inv.finished_at = None
+        inv.error = None
         inv.model = settings.groq_model
         await db.commit()
 
-        seq = 0
+        # The thread_id is what ties every checkpoint to this investigation.
+        # recursion_limit only covers THIS call, but step and token limits live in the state, so they persist.
+        thread = {**run_config(), "configurable": {"thread_id": str(investigation_id)}}
         error: str | None = None
+        seq = 0
         try:
-            state = make_initial_state(str(investigation_id), repo_url, owner, repo, focus)
-            last_call: dict | None = None
+            if resume:
+                snapshot = await graph.aget_state(thread)
+                state = dict(snapshot.values)
+                graph_input = None   # None = continue from the saved checkpoint
+                seq = (await db.execute(
+                    select(func.max(TraceStep.step)).where(TraceStep.investigation_id == investigation_id)
+                )).scalar() or 0
+                seq += 1
+                db.add(TraceStep(
+                    investigation_id=investigation_id, step=seq, node="resume",
+                    thought=f"Resumed from the last checkpoint (next: {', '.join(snapshot.next) or 'nothing'})",
+                ))
+                await db.commit()
+            else:
+                state = make_initial_state(str(investigation_id), repo_url, owner, repo, focus)
+                graph_input = state
+
+            last_call = _last_tool_call(state["messages"])
             t_prev = time.perf_counter()
 
-            async for update in agent_graph.astream(state, config=run_config(), stream_mode="updates"):
+            async for update in graph.astream(graph_input, config=thread, stream_mode="updates"):
                 for node, changes in update.items():
                     now = time.perf_counter()
                     before_in, before_out = state["tokens_in"], state["tokens_out"]
@@ -86,18 +113,16 @@ async def run_investigation(investigation_id: uuid.UUID) -> None:
 
                     seq += 1
                     db.add(TraceStep(
-                        investigation_id=investigation_id,
-                        step=seq,
-                        node=node,
+                        investigation_id=investigation_id, step=seq, node=node,
                         duration_ms=int((now - t_prev) * 1000),
                         tokens_in=(state["tokens_in"] - before_in) or None,
                         tokens_out=(state["tokens_out"] - before_out) or None,
                         **row,
                     ))
-                    inv.step_count = state["step"]       # live progress on the main row too
+                    inv.step_count = state["step"]
                     inv.tokens_in = state["tokens_in"]
                     inv.tokens_out = state["tokens_out"]
-                    await db.commit()                    # commit per step so a refresh sees progress
+                    await db.commit()
                     t_prev = time.perf_counter()
 
             if state["report"] is None:
@@ -109,9 +134,11 @@ async def run_investigation(investigation_id: uuid.UUID) -> None:
             inv.status = InvestigationStatus.COMPLETED.value
 
         except RateLimited:
-            error = "GitHub rate limit reached. Please try again in a few minutes."
+            error = "GitHub rate limit reached. You can resume this investigation in a few minutes."
+        except LLMBusy as e:
+            error = f"{e} You can resume this investigation."
         except (RepoNotFound, GitHubUnavailable, GitHubError) as e:
-            error = str(e)[:500]                         # written for users
+            error = str(e)[:500]
         except Exception:
             log.exception("Investigation %s crashed", investigation_id)
             error = "Something went wrong while investigating this repository."

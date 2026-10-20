@@ -4,7 +4,8 @@ from app.investigations.models import TraceStep
 import re
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
-
+from fastapi import Request
+from sqlalchemy import update
 from app.investigations.models import Investigation
 from app.investigations.service import run_investigation
 from app.core.database import get_db
@@ -30,6 +31,7 @@ class InvestigationCreate(BaseModel):
 @router.post("/investigations", status_code=202)
 async def create_investigation(
     body: InvestigationCreate,
+    request: Request, 
     background_tasks: BackgroundTasks,
     db=Depends(get_db),                # your async session dependency
     user=Depends(get_current_user),    # your auth dependency
@@ -46,7 +48,7 @@ async def create_investigation(
     await db.commit()
     await db.refresh(inv)
 
-    background_tasks.add_task(run_investigation, inv.id)   # runs after the response is sent
+    background_tasks.add_task(run_investigation, inv.id , request.app.state.agent_graph)   # runs after the response is sent
     return {"id": str(inv.id), "status": inv.status}
 
 async def _get_owned(db, investigation_id: UUID, user) -> Investigation:
@@ -99,3 +101,30 @@ async def get_trace(investigation_id: UUID, after: int = 0, db=Depends(get_db), 
         }
         for s in result.scalars().all()
     ]
+
+@router.post("/investigations/{investigation_id}/resume", status_code=202)
+async def resume_investigation(
+    investigation_id: UUID, request: Request, background_tasks: BackgroundTasks,
+    db=Depends(get_db), user=Depends(get_current_user),
+):
+    inv = await _get_owned(db, investigation_id, user)
+    graph = request.app.state.agent_graph
+
+    snapshot = await graph.aget_state({"configurable": {"thread_id": str(inv.id)}})
+    if not snapshot.next:
+        raise HTTPException(409, "Nothing to resume: this investigation has no saved progress left")
+
+    # Claim it atomically: if two requests arrive together, only one UPDATE matches.
+    claimed = await db.execute(
+        update(Investigation)
+        .where(Investigation.id == investigation_id, Investigation.status.in_(["interrupted", "failed"]))
+        .values(status="pending", error=None)
+        .returning(Investigation.id)
+    )
+    if claimed.scalar_one_or_none() is None:
+        await db.rollback()
+        raise HTTPException(409, f"Only interrupted or failed investigations can be resumed (this one is {inv.status})")
+    await db.commit()
+
+    background_tasks.add_task(run_investigation, inv.id, graph, True)
+    return {"id": str(inv.id), "status": "pending"}
